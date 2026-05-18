@@ -7,8 +7,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
+	"weak"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/internal/global"
@@ -66,8 +68,21 @@ func (cfg tracerProviderConfig) MarshalLog() any {
 type TracerProvider struct {
 	embedded.TracerProvider
 
-	mu             sync.Mutex
-	namedTracer    map[instrumentation.Scope]*tracer
+	mu sync.Mutex
+	// namedTracer caches tracers by instrumentation scope. The cache exists
+	// because tracer creation is not free: observ.NewTracer allocates metric
+	// instrument handles, and some callers rely on receiving the same tracer
+	// pointer for the same scope throughout the lifetime of their component.
+	// Pointer identity is stable for as long as the caller holds a strong
+	// reference; it is not guaranteed once the tracer is unreachable.
+	//
+	// Tracers are stored as weak references so that "use and forget" tracers
+	// (obtained once, used briefly, then dropped) can be garbage collected
+	// rather than accumulating in the map indefinitely. Tracer cardinality is
+	// expected to be low and stable in well-behaved applications; creating a
+	// unique scope per request or operation is misuse and will incur one
+	// allocation per call regardless of the cache.
+	namedTracer    map[instrumentation.Scope]weak.Pointer[tracer]
 	spanProcessors atomic.Pointer[spanProcessorStates]
 
 	isShutdown atomic.Bool
@@ -81,6 +96,30 @@ type TracerProvider struct {
 }
 
 var _ trace.TracerProvider = &TracerProvider{}
+
+type tracerCleanup struct {
+	provider *TracerProvider
+	scope    instrumentation.Scope
+	tracer   weak.Pointer[tracer]
+}
+
+func removeTracerFromCache(arg tracerCleanup) {
+	p := arg.provider
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Guard against the ABA problem: a new tracer for the same scope may have
+	// been registered before this cleanup runs. Compare the stored weak pointer
+	// by identity so we only remove the entry that belongs to the collected
+	// tracer, never a freshly created replacement. weak.Pointer is a struct
+	// whose equality is defined by the identity of the pointed-to object, so
+	// two weak.Pointers are equal if and only if they were made from the same
+	// pointer value — making this a safe identity check even after the object
+	// has been collected.
+	if cached, ok := p.namedTracer[arg.scope]; ok && cached == arg.tracer && cached.Value() == nil {
+		delete(p.namedTracer, arg.scope)
+	}
+}
 
 type experimentalOption interface {
 	Experimental()
@@ -112,7 +151,7 @@ func NewTracerProvider(opts ...TracerProviderOption) *TracerProvider {
 	o = ensureValidTracerProviderConfig(o)
 
 	tp := &TracerProvider{
-		namedTracer: make(map[instrumentation.Scope]*tracer),
+		namedTracer: make(map[instrumentation.Scope]weak.Pointer[tracer]),
 		sampler:     o.sampler,
 		idGenerator: o.idGenerator,
 		spanLimits:  o.spanLimits,
@@ -160,22 +199,40 @@ func (p *TracerProvider) Tracer(name string, opts ...trace.TracerOption) trace.T
 		if p.isShutdown.Load() {
 			return noop.NewTracerProvider().Tracer(name, opts...), true
 		}
-		t, ok := p.namedTracer[is]
-		if !ok {
-			t = &tracer{
-				provider:             p,
-				instrumentationScope: is,
+		if ref, ok := p.namedTracer[is]; ok {
+			if t := ref.Value(); t != nil {
+				return t, true
 			}
-
-			var err error
-			t.inst, err = observ.NewTracer()
-			if err != nil {
-				otel.Handle(err)
-			}
-
-			p.namedTracer[is] = t
+			delete(p.namedTracer, is)
 		}
-		return t, ok
+
+		t := &tracer{
+			provider:             p,
+			instrumentationScope: is,
+		}
+
+		var err error
+		// Recreating a collected tracer re-fetches the same shared metric
+		// instrument handles without accumulating new state.
+		t.inst, err = observ.NewTracer()
+		if err != nil {
+			otel.Handle(err)
+		}
+
+		ref := weak.Make(t)
+		p.namedTracer[is] = ref
+		// Register a cleanup to remove the dead cache entry after the tracer is
+		// collected. This is opportunistic hygiene: the entry is also pruned
+		// eagerly on the next lookup for the same scope (see the ref.Value()
+		// check above), so correctness does not depend on the cleanup running
+		// promptly or at all.
+		runtime.AddCleanup(t, removeTracerFromCache, tracerCleanup{
+			provider: p,
+			scope:    is,
+			tracer:   ref,
+		})
+
+		return t, false
 	}()
 	if !ok {
 		// This code is outside the mutex to not hold the lock while calling third party logging code:

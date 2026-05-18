@@ -415,6 +415,51 @@ func BenchmarkSpanProcessorOnEnd(b *testing.B) {
 	}
 }
 
+// BenchmarkTracerProviderTracer measures the two distinct hot paths through
+// TracerProvider.Tracer: a warm lookup that finds a live cached tracer, and a
+// first-creation path that allocates a new tracer, stores a weak reference, and
+// registers a cleanup. The warm path dominates in production; the creation path
+// establishes the baseline allocation cost of the weak-cache machinery.
+func BenchmarkTracerProviderTracer(b *testing.B) {
+	b.Run("Cached", func(b *testing.B) {
+		// Pre-warm the cache so every iteration hits the live-ref fast path.
+		tp := sdktrace.NewTracerProvider()
+		_ = tp.Tracer("cached")
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			_ = tp.Tracer("cached")
+		}
+	})
+
+	b.Run("UniqueScopes", func(b *testing.B) {
+		// Each iteration creates a tracer with a never-before-seen name, exercising
+		// the full allocation path: tracer struct, weak.Make, AddCleanup.
+		tp := sdktrace.NewTracerProvider()
+		b.ReportAllocs()
+		b.ResetTimer()
+		var i int
+		for b.Loop() {
+			_ = tp.Tracer(fmt.Sprintf("scope-%d", i))
+			i++
+		}
+	})
+
+	b.Run("CachedParallel", func(b *testing.B) {
+		// Measures lock contention on the warm-lookup path under concurrent load.
+		tp := sdktrace.NewTracerProvider()
+		_ = tp.Tracer("parallel")
+		b.ReportAllocs()
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			// pb.Next() is correct here: b.Loop() is not available on *testing.PB.
+			for pb.Next() {
+				_ = tp.Tracer("parallel")
+			}
+		})
+	})
+}
+
 func BenchmarkSpanProcessorVerboseLogging(b *testing.B) {
 	b.Cleanup(func(l logr.Logger) func() {
 		return func() { global.SetLogger(l) }

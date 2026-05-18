@@ -58,6 +58,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Allow unused tracers cached by `go.opentelemetry.io/otel/sdk/trace.TracerProvider` to be garbage collected by storing them with weak references. (#6351)
 - Limit OTLP request size to 32 MiB by default in `go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc`.
   The limit applies before compression, oversized requests are treated as non-retryable errors, and the limit can be configured with the new `WithMaxRequestSize` option. (#8157)
 - Limit OTLP request size to 32 MiB by default in `go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp`.

@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"runtime"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -457,6 +459,149 @@ func TestTracerProviderReturnsSameTracer(t *testing.T) {
 	assert.Same(t, t2, t5)
 }
 
+func TestTracerProviderReclaimsUnusedTracer(t *testing.T) {
+	p := NewTracerProvider()
+	tr := p.Tracer("reclaim").(*tracer)
+	scope := tr.instrumentationScope
+
+	collected := make(chan struct{})
+	runtime.AddCleanup(tr, func(done chan struct{}) { close(done) }, collected)
+
+	p.mu.Lock()
+	cached, ok := p.namedTracer[scope]
+	p.mu.Unlock()
+	require.True(t, ok)
+	require.Same(t, tr, cached.Value())
+
+	runtime.KeepAlive(tr)
+	tr = nil
+
+	require.Eventually(t, func() bool {
+		runtime.GC()
+		// Yield so the cleanup goroutine can be scheduled between GC cycles.
+		runtime.Gosched()
+		select {
+		case <-collected:
+			return true
+		default:
+			return false
+		}
+	}, 5*time.Second, 10*time.Millisecond)
+
+	assert.Eventually(t, func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		_, ok := p.namedTracer[scope]
+		return !ok
+	}, 5*time.Second, 10*time.Millisecond)
+
+	tr = p.Tracer("reclaim").(*tracer)
+	p.mu.Lock()
+	cached, ok = p.namedTracer[scope]
+	p.mu.Unlock()
+	require.True(t, ok)
+	assert.Same(t, tr, cached.Value())
+	assert.Equal(t, scope, tr.instrumentationScope)
+}
+
+func TestTracerProviderEagerPruning(t *testing.T) {
+	// This test exercises the inline dead-entry pruning path inside Tracer():
+	//   if ref.Value() == nil { delete(p.namedTracer, is) }
+	// The cleanup registered by runtime.AddCleanup is opportunistic; stale
+	// entries must also be pruned eagerly on the next lookup for the same scope
+	// so that Tracer() never returns a nil tracer when a live one is expected.
+	p := NewTracerProvider()
+
+	// Create a tracer and capture the weak pointer before dropping the only
+	// strong reference, so the poll below checks the pointer directly and does
+	// not race with the runtime cleanup that may delete the map entry.
+	tr := p.Tracer("eager-prune").(*tracer)
+	scope := tr.instrumentationScope
+	p.mu.Lock()
+	weakRef := p.namedTracer[scope]
+	p.mu.Unlock()
+
+	// KeepAlive ensures the compiler does not elide tr before this point;
+	// tr becomes unreachable after the statement below and is eligible for GC.
+	runtime.KeepAlive(tr)
+	tr = nil
+
+	// Drive GC until the captured weak pointer is dead.
+	require.Eventually(t, func() bool {
+		runtime.GC()
+		runtime.Gosched()
+		return weakRef.Value() == nil
+	}, 5*time.Second, 10*time.Millisecond, "weak pointer should become nil after GC")
+
+	// Call Tracer() again before the runtime cleanup has had a chance to fire.
+	// The eager-pruning branch detects the dead ref inline and returns a fresh,
+	// non-nil tracer without waiting for the cleanup goroutine.
+	tr2 := p.Tracer("eager-prune").(*tracer)
+
+	p.mu.Lock()
+	ref, ok := p.namedTracer[scope]
+	p.mu.Unlock()
+
+	require.True(t, ok, "cache must hold a new entry for the scope")
+	require.NotNil(t, ref.Value(), "the new cache entry must be live")
+	assert.Same(t, tr2, ref.Value(), "cached ref must point at the returned tracer")
+	assert.Equal(t, scope, tr2.instrumentationScope)
+}
+
+func TestTracerProviderABAGuard(t *testing.T) {
+	// Regression test for the ABA problem in removeTracerFromCache.
+	//
+	// Timeline being guarded:
+	//   1. Tracer "aba" is created; cleanup C1 is registered for it.
+	//   2. The tracer is collected; C1 is queued but has not run yet.
+	//   3. Tracer() is called again; the dead entry is pruned eagerly and a new
+	//      tracer with its own cleanup C2 is inserted for the same scope.
+	//   4. C1 finally runs.
+	// Without the identity check, C1 would delete the entry that belongs to the
+	// new tracer, leaving the cache stale.
+	p := NewTracerProvider()
+
+	// Step 1: create first tracer and grab its weak pointer.
+	tr1 := p.Tracer("aba").(*tracer)
+	scope := tr1.instrumentationScope
+	p.mu.Lock()
+	ref1 := p.namedTracer[scope]
+	p.mu.Unlock()
+
+	// Step 2: let tr1 be collected.
+	runtime.KeepAlive(tr1)
+	tr1 = nil
+	require.Eventually(t, func() bool {
+		runtime.GC()
+		runtime.Gosched()
+		return ref1.Value() == nil
+	}, 5*time.Second, 10*time.Millisecond, "first tracer should be collected")
+
+	// Step 3: call Tracer() while tr1's cleanup may not have run yet.
+	// The eager-prune path inserts a new tracer for the same scope.
+	tr2 := p.Tracer("aba").(*tracer)
+	p.mu.Lock()
+	ref2 := p.namedTracer[scope]
+	p.mu.Unlock()
+	require.NotNil(t, ref2.Value(), "second tracer must be live in cache")
+
+	// Step 4: simulate C1 firing by calling removeTracerFromCache directly
+	// with the old cleanup argument.  The ABA guard must leave the new entry
+	// untouched.
+	removeTracerFromCache(tracerCleanup{
+		provider: p,
+		scope:    scope,
+		tracer:   ref1, // stale weak pointer from the first tracer
+	})
+
+	p.mu.Lock()
+	after, ok := p.namedTracer[scope]
+	p.mu.Unlock()
+
+	require.True(t, ok, "ABA guard must not delete the new cache entry")
+	assert.Same(t, tr2, after.Value(), "cache must still point at the second tracer")
+}
+
 func TestTracerProviderObservability(t *testing.T) {
 	handler.Reset()
 	p := NewTracerProvider()
@@ -476,11 +621,14 @@ func TestTracerProviderObservability(t *testing.T) {
 }
 
 func TestTracerProviderObservabilityErrorsHandled(t *testing.T) {
-	handler.Reset()
-
 	orig := otel.GetMeterProvider()
 	t.Cleanup(func() { otel.SetMeterProvider(orig) })
 	otel.SetMeterProvider(&errMeterProvider{err: assert.AnError})
+	// Reset after SetMeterProvider: the first call to SetMeterProvider triggers
+	// delegation of any globally-cached instruments (from prior tests) to the
+	// new provider, which may produce unrelated Handle calls. Clear those so
+	// only errors from the tracer creation below are counted.
+	handler.Reset()
 
 	p := NewTracerProvider()
 
